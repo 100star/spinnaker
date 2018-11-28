@@ -3,7 +3,7 @@
 # This script assumes that the external dependencies were already installed.
 # to get these, run sudo InstallSpinnaker.sh --dependencies_only
 
-NVM_VERSION=v0.26.0
+NVM_VERSION=v0.33.11
 
 function process_args() {
   while [[ $# > 0 ]]
@@ -32,9 +32,31 @@ function process_args() {
 
 process_args "$@"
 
+# Add other repos
+sudo add-apt-repository -y ppa:openjdk-r/ppa
+curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | sudo apt-key add -
+echo "deb https://dl.yarnpkg.com/debian/ stable main" | sudo tee /etc/apt/sources.list.d/yarn.list
+
+sudo apt-get update -y
+
+sudo apt-get dist-upgrade -y
+sudo apt-get autoremove -y
+
+# Install Java
+apt-get install -y --force-yes openjdk-8-jdk
+sudo dpkg --purge --force-depends ca-certificates-java
+sudo apt-get install ca-certificates-java
+
+sudo apt-get install --no-install-recommends yarn -y
+sudo apt-get install -y node
+
+curl -s -L https://raw.githubusercontent.com/spinnaker/spinnaker/master/google/google_cloud_logging/add_google_cloud_logging.sh | sudo bash
+
+
 sudo apt-get install -y git
 sudo apt-get install -y zip
 sudo apt-get install -y build-essential
+sudo apt-get install -y python-virtualenv libffi-dev libssl-dev python-dev
 
 # redis normally comes in from a dependency on spinnaker,
 # which we have not installed.
@@ -70,3 +92,9 @@ fi
 
 # Install google command-line tool (for convenience)
 # in the bootstrap_dev.sh because it typically is not installed as root.
+
+# Install Halyard (https://github.com/spinnaker/halyard)
+cd /tmp
+curl -s -O https://raw.githubusercontent.com/spinnaker/halyard/master/install/stable/InstallHalyard.sh
+chmod +x ./InstallHalyard.sh
+sudo bash -c ./InstallHalyard.sh

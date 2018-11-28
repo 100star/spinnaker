@@ -1,10 +1,15 @@
 buildscript {
+  ext {
+    springBootVersion = "1.2.8.RELEASE"
+  }
   repositories {
     jcenter()
     maven { url "http://dl.bintray.com/spinnaker/gradle" }
+    maven { url "https://plugins.gradle.org/m2/" }
   }
   dependencies {
-    classpath 'com.netflix.spinnaker.gradle:spinnaker-gradle-project:3.1.0'
+    classpath 'com.netflix.spinnaker.gradle:spinnaker-gradle-project:3.15.0'
+    classpath "org.springframework.boot:spring-boot-gradle-plugin:${springBootVersion}"
   }
 }
 
@@ -38,23 +43,9 @@ ospackage {
   postInstall = file('pkg_scripts/postInstall.sh')
   postUninstall = file('pkg_scripts/postUninstall.sh')
 
-// files to put in the meta package
-  from('pylib') {
-    into spinnakerHome + '/pylib'
-  }
-
-  from('cassandra') {
-    into spinnakerHome + '/cassandra'
-  }
-
   from('install') {
     into spinnakerHome + '/install'
   }
-
-  from('runtime') {
-    into spinnakerHome + '/bin'
-    fileMode = 0755
-  }  
 
   from(file('etc/init/spinnaker.conf')) {
     into('/etc/init')
@@ -102,6 +93,7 @@ buildDeb {
   requires('spinnaker-clouddriver')
   requires('spinnaker-deck')
   requires('spinnaker-echo')
+  requires('spinnaker-fiat')
   requires('spinnaker-front50')
   requires('spinnaker-gate')
   requires('spinnaker-igor')

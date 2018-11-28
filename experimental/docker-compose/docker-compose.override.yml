@@ -6,9 +6,10 @@ clouddriver:
 echo: 
   volumes: 
     - "../../config:/opt/spinnaker/config"
-#deck:
-#  volumes: 
-#    - "../../config/settings.js:/deck/settings.js"
+deck:
+  volumes: 
+    - "../../config:/opt/spinnaker/config"
+    - "../../config/settings.js:/opt/deck/html/settings.js"
 front50: 
   volumes: 
     - "../../config:/opt/spinnaker/config"
@@ -23,4 +24,7 @@ orca:
     - "../../config:/opt/spinnaker/config"
 rosco: 
   volumes: 
+    - "../../config:/opt/spinnaker/config"
+fiat:
+  volumes:
     - "../../config:/opt/spinnaker/config"

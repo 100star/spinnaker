@@ -20,48 +20,72 @@
 # specifically for creating a new (running) codelab image out of a fresh
 # spinnaker image.
 
+JENKINS_PACKAGE=jenkins_2.89.3_all.deb
+APTLY_PACKAGE=aptly_1.2.0_linux_amd64
+
+if ! hal --version; then
+  echo "Halyard is not installed. Refer to http://www.spinnaker.io for installation instructions."
+  exit 1
+fi
+
+set -e
+
 if [[ `/usr/bin/id -u` -ne 0 ]]; then
   echo "$0 must be executed with root permissions; exiting"
   exit 1
 fi
 
-if [[ ! -d "/opt/spinnaker/pylib" ]]; then
-  echo "Spinnaker is not installed. Look at http://www.spinnaker.io for installation instructions."
-  exit 1
-fi
+service spinnaker stop || true
+service apache2 stop || true
 
-service spinnaker stop
-service apache2 stop
+# this allows us to skip any interactive post-install configuration,
+# specifically around keeping defaults for files that were modified.
+export DEBIAN_FRONTEND=noninteractive
 
-set -e
+# we don't want to update these. see github.com/spinnaker/spinnaker/issues/1279
+# for context.
+SPINNAKER_SUBSYSTEMS="spinnaker-clouddriver spinnaker-deck spinnaker-echo spinnaker-fiat spinnaker-front50 spinnaker-gate spinnaker-halyard spinnaker-igor spinnaker-orca spinnaker-rosco spinnaker"
 
+apt-mark hold $SPINNAKER_SUBSYSTEMS
 # update apt
 apt-get update
-apt-get -y upgrade
+# temporary workaround for where DEBIAN_FRONTEND=noninteractive isn't enough
+apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -y upgrade
+apt-mark unhold $SPINNAKER_SUBSYSTEMS
 
 # acquire and configure jenkins
 apt-get install -y git
-wget http://pkg.jenkins-ci.org/debian/binary/jenkins_2.1_all.deb
+wget https://pkg.jenkins.io/debian-stable/binary/$JENKINS_PACKAGE
 # dpkg partially installs jenkins and fails
-dpkg -i jenkins_2.1_all.deb || true
+dpkg -i $JENKINS_PACKAGE || true
+rm -f $JENKINS_PACKAGE
+
 # finish installing jenkins and its dependencies
 apt-get -f -y install
-sed -i "s/HTTP_PORT=.*/HTTP_PORT=9090/" /etc/default/jenkins
+sed -i "s/HTTP_PORT=.*/HTTP_PORT=5656/" /etc/default/jenkins
 
 # as jenkins, configure aptly
-cd /home/jenkins
-wget https://dl.bintray.com/smira/aptly/0.9.5/debian-squeeze-x64/aptly
-chown jenkins /home/jenkins/aptly
-sudo -u jenkins -H sh -c "chmod +x aptly"
-sudo -u jenkins -H sh -c "/home/jenkins/aptly repo create hello"
-sudo -u jenkins -H sh -c '/home/jenkins/aptly publish repo -architectures="amd64,i386" -component=main -distribution=trusty -skip-signing=true hello'
+JENKINS_HOMEDIR=~jenkins
+
+cd $JENKINS_HOMEDIR
+touch keep_user
+wget https://dl.bintray.com/smira/aptly/$APTLY_PACKAGE.tar.gz
+tar -xf $APTLY_PACKAGE.tar.gz
+rm $APTLY_PACKAGE.tar.gz
+
+sudo -u jenkins ln -s $APTLY_PACKAGE/aptly aptly
+sudo -u jenkins -H sh -c "./aptly repo create hello"
+sudo -u jenkins -H sh -c './aptly publish repo -architectures="amd64,i386" -component=main -distribution=trusty -skip-signing=true hello'
 
 # as jenkins, configure jenkins config directory
 # this storage bucket is public so we can pull the jenkins config from anywhere
 cd /var/lib/jenkins
 sudo -u jenkins -H sh -c 'wget https://storage.googleapis.com/codelab-jenkins-configuration/jenkins_dir.tar.gz'
 sudo -u jenkins -H sh -c 'tar -zxvf jenkins_dir.tar.gz'
+sudo -u jenkins -H sh -c 'rm jenkins_dir.tar.gz'
 sudo -u jenkins -H sh -c 'git clone https://github.com/kenzanlabs/hello-karyon-rxnetty.git'
+sudo -u jenkins -H sh -c 'cd /var/lib/jenkins/jobs/Hello-Build; rm -rf builds lastStable lastSuccessful scm-polling.log nextBuildNumber; echo 1 >> nextBuildNumber'
+
 service jenkins restart
 
 # configure nginx to serve the aptly repo and start it
@@ -75,7 +99,7 @@ cat > $nginx_default <<EOF
 server {
         listen 9999 default_server;
         listen [::]:9999 default_server ipv6only=on;
-        root /home/jenkins/.aptly/public;
+        root $JENKINS_HOMEDIR/.aptly/public;
         index index.html index.htm;
         server_name localhost;
         location / {
@@ -83,15 +107,9 @@ server {
         }
 }
 EOF
-service nginx restart
 
-wget https://storage.googleapis.com/codelab-startup-script/first_codelab_boot.sh -O /opt/spinnaker/install/first_codelab_boot.sh
-chmod +x /opt/spinnaker/install/first_codelab_boot.sh
 
-# configure nested properties in igor -- harder than a `sed` one-liner
-curl -s -O https://raw.githubusercontent.com/spinnaker/spinnaker/master/pylib/spinnaker/codelab_config.py
-PYTHONPATH=/opt/spinnaker/pylib python codelab_config.py
-rm codelab_config.py
+mv $(dirname $0)/first_codelab_boot.sh /var/spinnaker/startup
+chmod 755 /var/spinnaker/startup/first_codelab_boot.sh
+chown spinnaker:spinnaker /var/spinnaker/startup/first_codelab_boot.sh
 
-service spinnaker restart
-service apache2 restart

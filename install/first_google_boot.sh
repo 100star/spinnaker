@@ -24,6 +24,7 @@ set -u
 # We're running as root, but HOME might not be defined.
 AWS_DIR=/home/spinnaker/.aws
 KUBE_DIR=/home/spinnaker/.kube
+KUBE_VERSION=v1.3.4
 # Google Container Registry (GCR) password file directory.
 GCR_DIR=/home/spinnaker/.gcr
 SPINNAKER_INSTALL_DIR=/opt/spinnaker
@@ -38,11 +39,12 @@ STATUS_PREFIX="*"
 METADATA_URL="http://metadata.google.internal/computeMetadata/v1"
 INSTANCE_METADATA_URL="$METADATA_URL/instance"
 
-SPINNAKER_SUBSYSTEMS="spinnaker-clouddriver spinnaker-deck spinnaker-echo spinnaker-front50 spinnaker-gate spinnaker-igor spinnaker-orca spinnaker-rosco spinnaker"
+SPINNAKER_SUBSYSTEMS="spinnaker-clouddriver spinnaker-deck spinnaker-echo spinnaker-fiat spinnaker-front50 spinnaker-gate spinnaker-igor spinnaker-orca spinnaker-rosco spinnaker"
+SPINNAKER_DEPENDENCIES="redis-server"
 
 # By default we'll tradeoff the utmost in security for less startup latency
 # (often several minutes worth if there are any OS updates at all).
-# Note that this is only the initial boot off the image in this script, which is 
+# Note that this is only the initial boot off the image in this script, which is
 # intended to configure spinnaker from metadata, which is typically an adhoc or trial
 # scenario. A production instance would probably be using a different means to configure
 # spinnaker, or might be baked in, or might have different security policies not requiring
@@ -115,33 +117,11 @@ function replace_startup_script() {
 }
 
 function extract_spinnaker_local_yaml() {
-  local value=$(get_instance_metadata_attribute "spinnaker_local")
-  if [[ "$value" == "" ]]; then
-    return 0
-  fi
-
   local yml_path=$LOCAL_CONFIG_DIR/spinnaker-local.yml
-  sudo cp $SPINNAKER_INSTALL_DIR/config/default-spinnaker-local.yml $yml_path
-  chown spinnaker:spinnaker $yml_path
-  chmod 600 $yml_path
-
-  mkdir -p $AWS_DIR
-  chown -R spinnaker:spinnaker /home/spinnaker
-  
-  PYTHONPATH=$SPINNAKER_INSTALL_DIR/pylib python \
-      $SPINNAKER_INSTALL_DIR/pylib/spinnaker/transform_old_config.py \
-      "$value" /etc/default/spinnaker $yml_path $AWS_DIR/credentials
-
-  # Be extra sure we're protecting this
-  chown spinnaker:spinnaker $yml_path
-  chmod 600 $yml_path
-
-  if [[ -f $AWS_DIR/credentials ]]; then
-      chown spinnaker:spinnaker $AWS_DIR/credentials
-      chmod 600 $AWS_DIR/credentials
+  if clear_metadata_to_file "spinnaker_local" $yml_path; then
+    chown spinnaker:spinnaker $yml_path
+    chmod 600 $yml_path
   fi
-
-  clear_instance_metadata "spinnaker_local"
   return 0
 }
 
@@ -168,11 +148,18 @@ function extract_spinnaker_google_credentials() {
       chown spinnaker $json_path
       echo "Extracted google credentials to $json_path"
     else
-       rm $json_path
+      rm $json_path
     fi
+    write_default_value "SPINNAKER_GOOGLE_PROJECT_CREDENTIALS_PATH" "$json_path"
   else
     clear_instance_metadata "managed_project_credentials"
     json_path=""
+  fi
+
+  local consul_enabled=$(get_instance_metadata_attribute "consul_enabled")
+  if [ -n "$consul_enabled" ]; then
+      echo "Setting google consul enabled to $consul_enabled"
+      write_default_value "SPINNAKER_GOOGLE_CONSUL_ENABLED" "$consul_enabled"
   fi
 
   # This cant be configured when we create the instance because
@@ -211,27 +198,77 @@ function extract_spinnaker_aws_credentials() {
   fi
 }
 
-function extract_spinnaker_kube_credentials() {
+function attempt_write_kube_credentials() {
   local config_path="$KUBE_DIR/config"
   mkdir -p $(dirname $config_path)
   chown -R spinnaker:spinnaker $(dirname $config_path)
 
-  if clear_metadata_to_file "kube_config" $config_path; then
-    # This is a workaround for difficulties using the Google Deployment Manager
-    # to express no value. We'll use the value "None". But we don't want
-    # to officially support this, so we'll just strip it out of this first
-    # time boot if we happen to see it, and assume the Google Deployment Manager
-    # got in the way.
-    sed -i s/^None$//g $config_path
+  local kube_cluster=$(get_instance_metadata_attribute "kube_cluster")
+  local kube_zone=$(get_instance_metadata_attribute "kube_zone")
+  local kube_config=$(get_instance_metadata_attribute "kube_config")
+
+  if [ -n "$kube_cluster" ] && [ -n "$kube_config" ]; then
+    echo "WARNING: Both \"kube_cluster\" and \"kube_config\" were supplied as instance metadata, relying on \"kube_config\""
+  fi
+
+  if [ -n "$kube_config" ]; then
+    echo "Attempting to write kube_config to $config_path..."
+    if clear_metadata_to_file "kube_config" $config_path; then
+      # This is a workaround for difficulties using the Google Deployment Manager
+      # to express no value. We'll use the value "None". But we don't want
+      # to officially support this, so we'll just strip it out of this first
+      # time boot if we happen to see it, and assume the Google Deployment Manager
+      # got in the way.
+      sed -i s/^None$//g $config_path
+      if [[ -s $config_path ]]; then
+        chmod 400 $config_path
+        chown spinnaker $config_path
+        echo "Successfully wrote kube_config to $config_path"
+
+        return 0
+      else
+        echo "Failed to write kube_config to $config_path"
+        rm $config_path
+
+        return 1
+      fi
+    fi
+  fi
+
+  if [ -n "$kube_cluster" ]; then
+    echo "Downloading credentials for cluster $kube_cluster in zone $kube_zone..."
+
+    if [ -z "$kube_zone" ]; then
+      kube_zone=$MY_ZONE
+    fi
+
+    export KUBECONFIG=$config_path
+    gcloud config set container/use_client_certificate true
+    gcloud container clusters get-credentials $kube_cluster --zone $kube_zone 
+
     if [[ -s $config_path ]]; then
+      echo "Kubernetes credentials successfully extracted to $config_path"
       chmod 400 $config_path
       chown spinnaker:spinnaker $config_path
-      echo "Extracted Kubernetes config to $config_path"
+
+      return 0
     else
-       rm $config_path
+      echo "Failed to extract kubernetes credentials to $config_path"
+      rm $config_path
+
+      return 1
     fi
+  fi
+
+  echo "No kubernetes credentials or cluster provided."
+  return 1
+}
+
+function extract_spinnaker_kube_credentials() {
+  if attempt_write_kube_credentials; then
     write_default_value "SPINNAKER_KUBERNETES_ENABLED" "true"
-  else
+    clear_instance_metadata "kube_cluster"
+    clear_instance_metadata "kube_zone"
     clear_instance_metadata "kube_config"
   fi
 }
@@ -241,28 +278,62 @@ function extract_spinnaker_gcr_credentials() {
   mkdir -p $(dirname $config_path)
   chown -R spinnaker:spinnaker $(dirname $config_path)
 
-  if clear_metadata_to_file "gcr_json" $config_path; then
-    # This is a workaround for difficulties using the Google Deployment Manager
-    # to express no value. We'll use the value "None". But we don't want
-    # to officially support this, so we'll just strip it out of this first
-    # time boot if we happen to see it, and assume the Google Deployment Manager
-    # got in the way.
-    sed -i s/^None$//g $config_path
+  local gcr_enabled=$(get_instance_metadata_attribute "gcr_enabled")
+  local gcr_account=$(get_instance_metadata_attribute "gcr_account")
+
+  if [ -n "$gcr_enabled" ] || [ -n "$gcr_account" ]; then
+    echo "GCR enabled"
+
+    if [ -z "$gcr_account" ]; then
+      # This service account is enabled with the Compute API.
+      gcr_account=$(curl -s -H "Metadata-Flavor: Google" "$METADATA_URL/instance/service-accounts/default/email")
+      clear_instance_metadata "gcr_account"
+    fi
+
+    echo "Extracting GCR credentials for email $gcr_account"
+    gcloud iam service-accounts keys create $config_path --iam-account=$gcr_account
+
     if [[ -s $config_path ]]; then
+      echo "Extracted GCR credentials to $config_path"
+
       chmod 400 $config_path
       chown spinnaker:spinnaker $config_path
-      echo "Extracted GCR credentials to $config_path"
-    else
-       rm $config_path
-    fi
-    write_default_value "SPINNAKER_DOCKER_PASSWORD_FILE" $config_path
-    write_default_value "SPINNAKER_DOCKER_USERNAME" "_json_key"
-    write_default_value "SPINNAKER_DOCKER_REGISTRY" "https://gcr.io"
 
-    local repository=$(get_instance_metadata_attribute "docker_repository")
-    write_default_value "SPINNAKER_DOCKER_REPOSITORY" $repository
+      local gcr_location=$(get_instance_metadata_attribute "gcr_location")
+
+      if [ -z "$gcr_location" ]; then
+        gcr_location="https://gcr.io"
+      fi
+
+      write_default_value "SPINNAKER_DOCKER_PASSWORD_FILE" $config_path
+      write_default_value "SPINNAKER_DOCKER_USERNAME" "_json_key"
+      write_default_value "SPINNAKER_DOCKER_REGISTRY" $gcr_location
+    else
+      rm $config_path
+      echo "Failed to extract GCR credentials to $config_path"
+    fi
   else
-    clear_instance_metadata "gcr_json"
+    echo "GCR not enabled"
+    clear_instance_metadata "gcr_account"
+    clear_instance_metadata "gcr_enabled"
+  fi
+}
+
+function do_experimental_startup() {
+  local install_monitoring=$(get_instance_metadata_attribute "install_monitoring")
+  if [[ ! -z $install_monitoring ]]; then
+     IFS=' ' read -r -a all_args <<< "$install_monitoring"
+     local which=${all_args[0]}
+     local flags=${all_args[@]: 1:${#all_args}}
+     /opt/spinnaker-monitoring/third_party/$which/install.sh ${flags[@]}
+
+     if [[ ! -f /opt/spinnaker-monitoring/registry ]]; then
+         mv /opt/spinnaker-monitoring/registry.example \
+            /opt/spinnaker-monitoring/registry
+     fi
+
+     service spinnaker-monitoring restart
+     clear_instance_metadata "install_monitoring"
   fi
 }
 
@@ -289,6 +360,7 @@ MY_ZONE=""
 if full_zone=$(curl -s -H "Metadata-Flavor: Google" "$INSTANCE_METADATA_URL/zone"); then
   MY_ZONE=$(basename $full_zone)
   MY_PROJECT=$(curl -s -H "Metadata-Flavor: Google" "$METADATA_URL/project/project-id")
+  MY_PROJECT_NUMBER=$(curl -s -H "Metadata-Flavor: Google" "$METADATA_URL/project/numeric-project-id")
 else
   echo "Not running on Google Cloud Platform."
   exit -1
@@ -310,6 +382,12 @@ write_default_value "SPINNAKER_GOOGLE_PROJECT_ID" "$MY_PROJECT"
 write_default_value "SPINNAKER_GOOGLE_DEFAULT_ZONE" "$MY_ZONE"
 write_default_value "SPINNAKER_GOOGLE_DEFAULT_REGION" "${MY_ZONE%-*}"
 write_default_value "SPINNAKER_DEFAULT_STORAGE_BUCKET" "spinnaker-${MY_PROJECT}"
+write_default_value "SPINNAKER_GOOGLE_CONSUL_ENABLED" "false"
+
+# Use local project for stackdriver credentials, not the managed one.
+write_default_value "SPINNAKER_STACKDRIVER_PROJECT_NAME" "${MY_PROJECT}"
+write_default_value "SPINNAKER_STACKDRIVER_CREDENTIALS_PATH" ""
+
 echo "$STATUS_PREFIX  Extracting Configuration Info"
 extract_spinnaker_local_yaml
 
@@ -318,6 +396,8 @@ extract_spinnaker_credentials
 
 echo "$STATUS_PREFIX  Configuring Spinnaker"
 $SPINNAKER_INSTALL_DIR/scripts/reconfigure_spinnaker.sh
+
+do_experimental_startup
 
 
 # Replace this first time boot with the normal startup script
@@ -354,10 +434,10 @@ fi
 # This can take several minutes so we are performing it at the end after
 # spinnaker has already started and is available.
 
-apt-mark hold $SPINNAKER_SUBSYSTEMS
+apt-mark hold $SPINNAKER_SUBSYSTEMS $SPINNAKER_DEPENDENCIES
 apt-get -y update
-DEBIAN_FRONTEND=noninteractive apt-get -y dist-upgrade
-apt-mark unhold $SPINNAKER_SUBSYSTEMS
+DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" -y dist-upgrade
+apt-mark unhold $SPINNAKER_SUBSYSTEMS $SPINNAKER_DEPENDENCIES
 
 if [[ -f /opt/spinnaker/cassandra/SPINNAKER_INSTALLED_CASSANDRA ]]; then
   sed -i "s/start_rpc: false/start_rpc: true/" /etc/cassandra/cassandra.yaml
